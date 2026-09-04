@@ -1,0 +1,99 @@
+name: Refresh card database
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/add-vendetta
+    paths:
+      - .github/workflows/refresh-card-database.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-card-database-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Scrape and validate cards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: model/requirements.txt
+
+      - name: Install scraper dependencies
+        run: python -m pip install requests tqdm Pillow opencv-python-headless numpy
+
+      - name: Refresh card data
+        run: python model/cards_scraper.py
+
+      - name: Validate Vendetta data
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          hashes_path = Path("public/card-hashes.json")
+          cards_dir = Path("public/cards")
+
+          if not hashes_path.is_file():
+              raise SystemExit("public/card-hashes.json was not generated")
+
+          payload = json.loads(hashes_path.read_text(encoding="utf-8"))
+          cards = payload.get("cards", [])
+          vendetta = [card for card in cards if card.get("set") == "VEN"]
+          hash_ids = {card.get("id") for card in cards}
+          image_ids = {path.stem for path in cards_dir.glob("*.webp")}
+
+          if len(cards) < 1189:
+              raise SystemExit(f"Expected at least 1189 cards; generated {len(cards)}")
+          if len(vendetta) < 237:
+              raise SystemExit(f"Expected at least 237 Vendetta cards; generated {len(vendetta)}")
+          if hash_ids != image_ids:
+              missing_images = sorted(hash_ids - image_ids)
+              missing_hashes = sorted(image_ids - hash_ids)
+              raise SystemExit(
+                  "Generated images and hashes do not match. "
+                  f"Missing images: {missing_images[:10]}; "
+                  f"missing hashes: {missing_hashes[:10]}"
+              )
+
+          summary = (
+              "## Card database refresh\n\n"
+              f"- Total cards: **{len(cards)}**\n"
+              f"- Vendetta cards: **{len(vendetta)}**\n"
+              f"- Card images: **{len(image_ids)}**\n"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write(summary)
+
+          print(f"Validated {len(cards)} cards, including {len(vendetta)} Vendetta cards.")
+          PY
+
+      - name: Commit refreshed card data
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f public/card-hashes.json public/cards
+
+          if git diff --cached --quiet; then
+            echo "Card data is already current."
+            exit 0
+          fi
+
+          git commit -m "Add Vendetta card data"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
